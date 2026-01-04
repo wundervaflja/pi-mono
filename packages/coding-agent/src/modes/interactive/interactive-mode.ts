@@ -16,6 +16,7 @@ import {
 	type Component,
 	Container,
 	getEditorKeybindings,
+	HorizontalSplit,
 	Input,
 	Loader,
 	Markdown,
@@ -48,6 +49,7 @@ import { BranchSummaryMessageComponent } from "./components/branch-summary-messa
 import { CompactionSummaryMessageComponent } from "./components/compaction-summary-message.js";
 import { CustomEditor } from "./components/custom-editor.js";
 import { DynamicBorder } from "./components/dynamic-border.js";
+import { FileChangesSidebar } from "./components/file-changes-sidebar.js";
 import { FooterComponent } from "./components/footer.js";
 import { HookEditorComponent } from "./components/hook-editor.js";
 import { HookInputComponent } from "./components/hook-input.js";
@@ -110,6 +112,9 @@ export class InteractiveMode {
 	// Tool execution tracking: toolCallId -> component
 	private pendingTools = new Map<string, ToolExecutionComponent>();
 
+	// Tool args tracking for file changes sidebar: toolCallId -> args
+	private pendingToolArgs = new Map<string, { toolName: string; args: Record<string, unknown> }>();
+
 	// Tool output expansion state
 	private toolOutputExpanded = false;
 
@@ -148,6 +153,17 @@ export class InteractiveMode {
 	// Custom tools for custom rendering
 	private customTools: Map<string, LoadedCustomTool>;
 
+	// Clipboard image tracking: imageId -> temp file path
+	private clipboardImages = new Map<number, string>();
+	private clipboardImageCounter = 0;
+
+	// File changes sidebar
+	private fileChangesSidebar: FileChangesSidebar;
+	private sidebarEnabled = false;
+	private sidebarWidth = 30;
+	private mainContent: Container | undefined;
+	private splitLayout: HorizontalSplit | undefined;
+
 	// Convenience accessors
 	private get agent() {
 		return this.session.agent;
@@ -182,6 +198,7 @@ export class InteractiveMode {
 		this.editorContainer.addChild(this.editor);
 		this.footer = new FooterComponent(session);
 		this.footer.setAutoCompactEnabled(session.autoCompactionEnabled);
+		this.fileChangesSidebar = new FileChangesSidebar();
 
 		// Define slash commands for autocomplete
 		const slashCommands: SlashCommand[] = [
@@ -200,6 +217,7 @@ export class InteractiveMode {
 			{ name: "new", description: "Start a new session" },
 			{ name: "compact", description: "Manually compact the session context" },
 			{ name: "resume", description: "Resume a different session" },
+			{ name: "sidebar", description: "Toggle file changes sidebar" },
 		];
 
 		// Load hide thinking block setting
@@ -306,26 +324,47 @@ export class InteractiveMode {
 			theme.fg("muted", " to attach");
 		const header = new Text(`${logo}\n${instructions}`, 1, 0);
 
-		// Setup UI layout
-		this.ui.addChild(new Spacer(1));
-		this.ui.addChild(header);
-		this.ui.addChild(new Spacer(1));
+		// Setup UI layout - main content container for horizontal split with sidebar
+		this.mainContent = new Container();
+		const mainContent = this.mainContent;
+		mainContent.addChild(new Spacer(1));
+		mainContent.addChild(header);
+		mainContent.addChild(new Spacer(1));
 
 		// Add changelog if provided
 		if (this.changelogMarkdown) {
-			this.ui.addChild(new DynamicBorder());
+			mainContent.addChild(new DynamicBorder());
 			if (this.settingsManager.getCollapseChangelog()) {
 				const versionMatch = this.changelogMarkdown.match(/##\s+\[?(\d+\.\d+\.\d+)\]?/);
 				const latestVersion = versionMatch ? versionMatch[1] : this.version;
 				const condensedText = `Updated to v${latestVersion}. Use ${theme.bold("/changelog")} to view full changelog.`;
-				this.ui.addChild(new Text(condensedText, 1, 0));
+				mainContent.addChild(new Text(condensedText, 1, 0));
 			} else {
-				this.ui.addChild(new Text(theme.bold(theme.fg("accent", "What's New")), 1, 0));
-				this.ui.addChild(new Spacer(1));
-				this.ui.addChild(new Markdown(this.changelogMarkdown.trim(), 1, 0, getMarkdownTheme()));
-				this.ui.addChild(new Spacer(1));
+				mainContent.addChild(new Text(theme.bold(theme.fg("accent", "What's New")), 1, 0));
+				mainContent.addChild(new Spacer(1));
+				mainContent.addChild(new Markdown(this.changelogMarkdown.trim(), 1, 0, getMarkdownTheme()));
+				mainContent.addChild(new Spacer(1));
 			}
-			this.ui.addChild(new DynamicBorder());
+			mainContent.addChild(new DynamicBorder());
+		}
+
+		mainContent.addChild(this.chatContainer);
+		mainContent.addChild(this.pendingMessagesContainer);
+		mainContent.addChild(this.statusContainer);
+		mainContent.addChild(new Spacer(1));
+		mainContent.addChild(this.editorContainer);
+		mainContent.addChild(this.footer);
+
+		// Create split layout for sidebar
+		this.splitLayout = new HorizontalSplit(mainContent, this.fileChangesSidebar, this.sidebarWidth, "│", (s) =>
+			theme.fg("dim", s),
+		);
+
+		// Add layout based on sidebar state
+		if (this.sidebarEnabled) {
+			this.ui.addChild(this.splitLayout);
+		} else {
+			this.ui.addChild(mainContent);
 		}
 
 		this.ui.addChild(this.chatContainer);
@@ -1080,6 +1119,11 @@ export class InteractiveMode {
 				await this.shutdown();
 				return;
 			}
+			if (text === "/sidebar") {
+				this.editor.setText("");
+				this.toggleSidebar();
+				return;
+			}
 
 			// Handle bash command (! for normal, !! for excluded from context)
 			if (text.startsWith("!")) {
@@ -1238,6 +1282,12 @@ export class InteractiveMode {
 				break;
 
 			case "tool_execution_start": {
+				// Store args for file changes tracking
+				this.pendingToolArgs.set(event.toolCallId, {
+					toolName: event.toolName,
+					args: event.args as Record<string, unknown>,
+				});
+
 				if (!this.pendingTools.has(event.toolCallId)) {
 					const component = new ToolExecutionComponent(
 						event.toolName,
@@ -1267,9 +1317,17 @@ export class InteractiveMode {
 
 			case "tool_execution_end": {
 				const component = this.pendingTools.get(event.toolCallId);
+				const toolInfo = this.pendingToolArgs.get(event.toolCallId);
+				this.pendingToolArgs.delete(event.toolCallId);
+
 				if (component) {
 					component.updateResult({ ...event.result, isError: event.isError });
 					this.pendingTools.delete(event.toolCallId);
+
+					// Track file changes for sidebar
+					if (!event.isError && this.sidebarEnabled && toolInfo) {
+						this.trackFileChange(toolInfo.toolName, toolInfo.args, event.result);
+					}
 					this.ui.requestRender();
 				}
 				break;
@@ -2626,6 +2684,80 @@ export class InteractiveMode {
 		this.chatContainer.addChild(new Spacer(1));
 		this.chatContainer.addChild(new ArminComponent(this.ui));
 		this.ui.requestRender();
+	}
+
+	/**
+	 * Toggle the file changes sidebar visibility.
+	 */
+	private toggleSidebar(): void {
+		if (!this.mainContent || !this.splitLayout) return;
+
+		this.sidebarEnabled = !this.sidebarEnabled;
+
+		// Swap the layout
+		if (this.sidebarEnabled) {
+			this.ui.removeChild(this.mainContent);
+			this.ui.addChild(this.splitLayout);
+		} else {
+			this.ui.removeChild(this.splitLayout);
+			this.ui.addChild(this.mainContent);
+		}
+
+		// Force full re-render
+		this.ui.requestRender(true);
+
+		// Show status message
+		const status = this.sidebarEnabled ? "visible" : "hidden";
+		this.chatContainer.addChild(new Text(theme.fg("muted", `Sidebar ${status}`), 1, 0));
+	}
+
+	/**
+	 * Track file changes from tool execution for the sidebar.
+	 */
+	private trackFileChange(toolName: string, args: Record<string, unknown>, result: { details?: unknown }): void {
+		const filePath = args.path as string | undefined;
+		if (!filePath) return;
+
+		const timestamp = Date.now();
+
+		switch (toolName) {
+			case "write": {
+				const content = args.content as string | undefined;
+				const linesAdded = content ? content.split("\n").length : 0;
+				// Check if file existed before (heuristic: if result message says "wrote" vs "created")
+				const resultText = (result as { content?: Array<{ text?: string }> })?.content?.[0]?.text ?? "";
+				const isNew = !fs.existsSync(filePath) || resultText.toLowerCase().includes("created");
+				this.fileChangesSidebar.addChange({
+					path: filePath,
+					type: isNew ? "created" : "modified",
+					linesAdded,
+					timestamp,
+				});
+				break;
+			}
+			case "edit": {
+				const oldText = args.oldText as string | undefined;
+				const newText = args.newText as string | undefined;
+				const linesRemoved = oldText ? oldText.split("\n").length : 0;
+				const linesAdded = newText ? newText.split("\n").length : 0;
+				this.fileChangesSidebar.addChange({
+					path: filePath,
+					type: "modified",
+					linesAdded: Math.max(0, linesAdded - linesRemoved),
+					linesRemoved: Math.max(0, linesRemoved - linesAdded),
+					timestamp,
+				});
+				break;
+			}
+			case "read": {
+				this.fileChangesSidebar.addChange({
+					path: filePath,
+					type: "read",
+					timestamp,
+				});
+				break;
+			}
+		}
 	}
 
 	private async handleBashCommand(command: string, excludeFromContext = false): Promise<void> {
